@@ -12,6 +12,7 @@
 
 | | Product | Purpose |
 |---|---|---|
+| **Write** | [**Skeleton Writer**](https://github.com/brandflowr/Skeleton-Writer) | A desktop writing app for prose, screenplays, and structured stories, designed for SKEL as its native project format. Free Windows preview downloads and documentation. |
 | **Create** | [**Genlock Studio**](https://genlockstudio.com/) | A first-class desktop studio for authoring storyboards and visual narratives with SKEL as its native story format. |
 | **View** | [**SKEL X-Ray**](https://xray.openskeleton.dev/) | A free web viewer for opening and inspecting SKEL format files. |
 | **Learn** | [**OpenSKELETON**](https://openskeleton.dev/) | The official home of the SKEL format, documentation, ecosystem, and releases. |

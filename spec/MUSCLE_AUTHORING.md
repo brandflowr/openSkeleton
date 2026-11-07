@@ -88,7 +88,7 @@ Transform MUSCLEs never return a modified document — they return [RFC 6902 JSO
 }
 ```
 
-The host checks every path against your capabilities, refuses writes to `creative_status: locked` entities and to `metadata.plugins`, applies your set atomically, re-validates the document, and rolls back if anything breaks. Worst case for a buggy plugin: a rejected, logged patch set. You cannot corrupt a project.
+The host checks every path against your capabilities, refuses writes to `creative_status: locked` entities and to `metadata.plugins`, applies your set atomically, re-validates the document, and rolls back if anything breaks. Move sources, ancestor replacements and array shifts are checked as well as destinations. These guarantees cover returned patches. CLI plugins execute with the host user’s operating-system permissions and must be trusted unless the embedding application supplies process isolation.
 
 For derived-value hooks, return `subject_replacement` instead — e.g. the rewritten prompt string on `prompt.assemble.after`. It affects only the in-flight value, never the saved document.
 

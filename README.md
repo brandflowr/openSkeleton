@@ -96,7 +96,9 @@ Get live validation + token autocomplete in VS Code by starting your `.skel` fil
 skel_version: "2.0"
 ```
 
-Repo health: `npm install && npm run check` validates every shipped artifact, runs the conformance corpus, the MUSCLE host demo, and the Fountain round-trip — the same suite as CI.
+Use Node ≥22.12 and `npm ci && npm run check`. The suite validates shipped artifacts, all conformance fixtures, browser/Node parity, malformed input, plugin transactions, shipped CLI routes and Fountain edit preservation. `npm run test:package` installs local spec/CLI tarballs in an independent temporary consumer and tests their real entry points. The CLI source runs directly from this checkout; its release package depends on the matching spec version.
+
+The public `@openskeleton/spec/validator/browser` export shares semantic rules with `@openskeleton/spec/validator`. Filesystem loading and sidecar discovery stay in the Node adapter. `parseDocument` enforces resource limits; `validateDocumentShape` is the renderability gate for readers. Compiled schema validators ship in the package and require no browser eval. Run `npm run generate:validators` after schema changes; checks reject stale generated output. External registries and sidecars are checked only when supplied.
 
 ---
 

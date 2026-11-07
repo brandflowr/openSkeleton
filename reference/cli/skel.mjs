@@ -65,7 +65,7 @@ switch (command) {
     let studio;
     if (studioPath) {
       try {
-        studio = JSON.parse(readFileSync(studioPath, "utf-8"));
+        studio = loadDocument(studioPath);
       } catch (e) {
         fail2(`cannot read studio registry: ${e.message}`);
       }

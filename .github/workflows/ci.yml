@@ -1,18 +1,5 @@
-# CI for the SKEL spec repo — automates exactly what the launch review ran by hand:
-# 1. Validate every shipped JSON/YAML artifact against its schema (caught P0-1).
-# 2. Meta-validate + strict-compile all schemas with AJV.
-# 3. Run the conformance corpus through the reference validator.
-# 4. Run the MUSCLE reference-host demo and assert its sanity check.
-# 5. Run the Fountain adapter round-trip (byte-identical) test.
-# 6. Check relative markdown links.
 name: ci
-
-on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
-
+on: [push, pull_request]
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -20,20 +7,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
-      - name: Validate shipped artifacts against schemas
-        run: npm run validate:examples
-      - name: Conformance corpus
-        run: npm run conformance
-      - name: MUSCLE reference host demo
-        run: |
-          node reference/muscle-host/demo/run-demo.mjs | tee demo.out
-          grep -q "sanity check: PASS" demo.out
-      - name: Continuity-guard worked MUSCLE
-        run: npm run continuity
-      - name: Fountain round-trip
-        run: npm run roundtrip
-      - name: Markdown link check
-        run: npm run links
+      - run: npm run check
+      - run: npm run test:package
+      - run: npm audit --audit-level=moderate

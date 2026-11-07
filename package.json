@@ -1,6 +1,6 @@
 {
   "name": "@openskeleton/spec",
-  "version": "2.10.1",
+  "version": "2.10.2",
   "description": "SKEL (Story Keyframe Extensible Layout) — JSON Schemas, default token key file, TypeScript types, and reference tooling for the open storyboard data format.",
   "license": "MIT",
   "type": "module",
@@ -8,7 +8,15 @@
     "type": "git",
     "url": "git+https://github.com/brandflowr/SKELETON-Brandflowr.git"
   },
-  "keywords": ["skel", "bone", "muscle", "storyboard", "screenplay", "json-schema", "ai-filmmaking"],
+  "keywords": [
+    "skel",
+    "bone",
+    "muscle",
+    "storyboard",
+    "screenplay",
+    "json-schema",
+    "ai-filmmaking"
+  ],
   "files": [
     "spec/**",
     "profiles/**",
@@ -16,33 +24,52 @@
     "types/**",
     "README.md",
     "LICENSE",
-    "TRADEMARKS.md"
+    "TRADEMARKS.md",
+    "lib/**",
+    "reference/fountain-adapter/skel-fountain.mjs",
+    "reference/continuity-guard/continuity-guard.mjs",
+    "reference/muscle-host/*.mjs"
   ],
   "types": "./types/skel.d.ts",
   "exports": {
     ".": {
       "types": "./types/skel.d.ts"
     },
-    "./validator": "./reference/cli/lib/validate.mjs",
+    "./validator": {
+      "types": "./lib/validator.d.mts",
+      "import": "./lib/validator.mjs"
+    },
     "./spec/*": "./spec/*",
     "./profiles/*": "./profiles/*",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./validator/browser": {
+      "types": "./lib/browser.d.mts",
+      "import": "./lib/browser.mjs"
+    },
+    "./parse": {
+      "types": "./lib/parse.d.mts",
+      "import": "./lib/parse.mjs"
+    }
   },
-  "workspaces": [
-    "reference/cli"
-  ],
   "scripts": {
-    "check": "npm run validate:examples && npm run conformance && npm run demo && npm run continuity && npm run roundtrip && npm run links",
+    "check": "node scripts/build-browser-validators.mjs --check && npm run validate:examples && npm run conformance && npm run test:regressions && npm run demo && npm run continuity && npm run roundtrip && npm run links",
     "validate:examples": "node scripts/validate-examples.mjs",
     "conformance": "node scripts/run-conformance.mjs",
     "demo": "node reference/muscle-host/demo/run-demo.mjs",
     "continuity": "node reference/continuity-guard/test-continuity-guard.mjs",
     "roundtrip": "node reference/fountain-adapter/test-roundtrip.mjs",
-    "links": "node scripts/check-links.mjs"
+    "links": "node scripts/check-links.mjs",
+    "generate:validators": "node scripts/build-browser-validators.mjs",
+    "test:regressions": "node --test tests/regressions.test.mjs",
+    "test:package": "node scripts/test-package.mjs",
+    "prepack": "node scripts/build-browser-validators.mjs --check"
   },
   "dependencies": {
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
-    "js-yaml": "^4.1.0"
+    "js-yaml": "^4.3.2"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

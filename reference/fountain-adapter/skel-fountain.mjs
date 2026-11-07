@@ -161,6 +161,8 @@ export function fountainToSkel(source, { file = "input.fountain" } = {}) {
     characters: [],
   };
   if (author) doc.metadata.author = author;
+  doc.metadata.extensions[XF].source_title = doc.metadata.title;
+  if (author) doc.metadata.extensions[XF].source_author = author;
   if (titlePageRaw !== null) doc.metadata.extensions[XF].title_page_raw = titlePageRaw;
   doc.metadata.extensions[XF].trailing = trailing;
 
@@ -205,7 +207,7 @@ export function fountainToSkel(source, { file = "input.fountain" } = {}) {
         scene_id: scene.id,
         action,
         v_setup: { size: "ms", angle: "eye" },
-        extensions: { [XF]: { source_text: sourceText } },
+        extensions: { [XF]: { source_text: sourceText, source_action: action } },
       };
       if (action !== sourceText.replace(/^!/, "").trim()) shot.extensions[XF].full_action = sourceText;
       doc.shots.push(shot);
@@ -234,7 +236,7 @@ export function fountainToSkel(source, { file = "input.fountain" } = {}) {
           scene_id: scene.id,
           action: `${name} speaks.`,
           v_setup: { size: "mcu", angle: "eye" },
-          extensions: { [XF]: { synthesized_for_dialogue: true } },
+          extensions: { [XF]: { synthesized_for_dialogue: true, source_action: `${name} speaks.` } },
         };
         doc.shots.push(shot);
         scene.shot_refs.push(shot.id);
@@ -272,71 +274,103 @@ export function fountainToSkel(source, { file = "input.fountain" } = {}) {
 
 // ── Export ────────────────────────────────────────────────────────────────────
 export function skelToFountain(doc) {
-  const xfMeta = doc.metadata?.extensions?.[XF] ?? {};
+  const metadata = doc.metadata ?? {};
+  const xfMeta = metadata.extensions?.[XF] ?? {};
   const out = [];
-
-  if (xfMeta.title_page_raw != null) out.push(xfMeta.title_page_raw);
-  else if (doc.metadata?.title) {
-    out.push([`Title: ${doc.metadata.title}`, doc.metadata.author ? `Author: ${doc.metadata.author}` : null].filter(Boolean).join("\n"));
-  }
-  for (const p of xfMeta.preamble ?? []) out.push(p);
-
-  const shotById = new Map((doc.shots ?? []).map((s) => [s.id, s]));
-  const charById = new Map((doc.characters ?? []).map((c) => [c.id, c]));
-  const sceneById = new Map((doc.scenes ?? []).map((s) => [s.id, s]));
-
-  const renderDialogue = (shot, index) => {
-    const lines = Array.isArray(shot?.dialogue) ? shot.dialogue : shot?.dialogue != null ? [shot.dialogue] : [];
-    const d = lines[index];
-    if (d == null) return null;
-    const line = typeof d === "string" ? { text: d } : d;
-    const name = charById.get(line.character_ref)?.name ?? (line.character_ref ?? "UNKNOWN").replace(/^char_/, "").toUpperCase();
-    const ext = line.mode === "vo" ? " (V.O.)" : line.mode === "os" ? " (O.S.)" : "";
-    return `${name.toUpperCase()}${ext}\n${line.text}`;
-  };
-
-  const orderedScenes = (doc.acts ?? []).flatMap((a) => (a.scene_refs ?? []).map((r) => sceneById.get(r))).filter(Boolean);
-  for (const scene of orderedScenes.length ? orderedScenes : doc.scenes ?? []) {
-    const xf = scene.extensions?.[XF] ?? {};
-    out.push(xf.heading_raw != null && xf.heading_raw.replace(/^\./, "") === scene.header ? xf.heading_raw : scene.header);
-
-    const elements = xf.elements;
-    if (elements) {
-      for (const el of elements) {
-        const shot = el.shot_ref ? shotById.get(el.shot_ref) : null;
-        if (el.type === "action") {
-          const source = shot?.extensions?.[XF]?.source_text;
-          if (source != null && shot && deriveAction(source.replace(/^!/, "")) === shot.action) out.push(source);
-          else if (shot) out.push(shot.extensions?.[XF]?.full_action ?? shot.action);
-        } else if (el.type === "dialogue") {
-          const rendered = renderDialogue(shot, el.dialogue_index ?? 0);
-          if (el.raw != null && rendered != null) {
-            const rawText = el.raw.split("\n").slice(1).filter((l) => !/^\s*\(.*\)\s*$/.test(l.trim())).join(" ").replace(/\s+/g, " ").trim();
-            const currentText = rendered.split("\n").slice(1).join(" ");
-            out.push(rawText === currentText ? el.raw : rendered);
-          } else if (rendered != null) out.push(rendered);
-          else if (el.raw != null) out.push(el.raw);
-        } else if (el.raw != null) {
-          out.push(el.raw);
-        }
-      }
-    } else {
-      // No parked structure (document not born from Fountain): render from SKEL.
-      for (const ref of scene.shot_refs ?? []) {
-        const shot = shotById.get(ref);
-        if (!shot) continue;
-        out.push(shot.extensions?.[XF]?.full_action ?? shot.action);
-        const lines = Array.isArray(shot.dialogue) ? shot.dialogue : shot.dialogue != null ? [shot.dialogue] : [];
-        lines.forEach((_, i) => {
-          const r = renderDialogue(shot, i);
-          if (r) out.push(r);
-        });
-      }
+  if (xfMeta.title_page_raw != null) {
+    const fields = xfMeta.title_page_raw.split(/\n(?=\S)/);
+    const seen = new Set();
+    const titleFields = fields.flatMap(field => {
+      const match = field.match(/^(Title|Authors?):\s*(.*)/i);
+      if (!match) return [field];
+      const key = /^title$/i.test(match[1]) ? 'title' : 'author';
+      seen.add(key);
+      const original = xfMeta[`source_${key}`] ?? (key === 'title' ? match[2].replace(/^_+\**|\**_+$/g,'').trim() : match[2]);
+      if (metadata[key] === original) return [field];
+      return metadata[key] ? [`${match[1]}: ${metadata[key]}`] : [];
+    });
+    for (const key of ['title','author']) {
+      if (!seen.has(key) && metadata[key] && metadata[key] !== xfMeta[`source_${key}`]) titleFields.push(`${key === 'title' ? 'Title' : 'Author'}: ${metadata[key]}`);
     }
+    if (titleFields.length) out.push(titleFields.join('\n'));
+  } else if (metadata.title) {
+    out.push([`Title: ${metadata.title}`, metadata.author ? `Author: ${metadata.author}` : null].filter(Boolean).join('\n'));
   }
+  out.push(...xfMeta.preamble ?? []);
 
-  return out.join("\n\n") + (xfMeta.trailing ?? "\n");
+  const shotById = new Map((doc.shots ?? []).map(s => [s.id,s]));
+  const charById = new Map((doc.characters ?? []).map(c => [c.id,c]));
+  const sceneById = new Map((doc.scenes ?? []).map(s => [s.id,s]));
+  const linesOf = shot => Array.isArray(shot.dialogue) ? shot.dialogue : shot.dialogue != null ? [shot.dialogue] : [];
+  const dialogue = (shot,index,raw) => {
+    const item = linesOf(shot)[index];
+    if (item == null) return null;
+    const line = typeof item === 'string' ? {text:item} : item;
+    const name = charById.get(line.character_ref)?.name ?? (line.character_ref ?? 'UNKNOWN').replace(/^char_/,'').toUpperCase();
+    const mode = line.mode ?? 'spoken';
+    if (raw != null) {
+      const parts = raw.split('\n');
+      const cue = parseCueLine(parts[0].trim());
+      const text = parts.slice(1).filter(l => !/^\s*\(.*\)\s*$/.test(l.trim())).join(' ').replace(/\s+/g,' ').trim();
+      if (cue.name.toUpperCase() === name.toUpperCase() && cue.mode === mode && text === line.text) return raw;
+    }
+    const suffix = mode === 'vo' ? ' (V.O.)' : mode === 'os' ? ' (O.S.)' : mode === 'spoken' ? '' : ` (${mode.toUpperCase()})`;
+    return `${name.toUpperCase()}${suffix}\n${line.text}`;
+  };
+  const action = shot => {
+    const xf = shot.extensions?.[XF] ?? {};
+    const sourceAction = xf.source_action ?? (xf.source_text != null ? deriveAction(xf.source_text.replace(/^!/,'')) : undefined);
+    if (sourceAction !== undefined && shot.action !== sourceAction) return shot.action;
+    return xf.full_action ?? xf.source_text ?? shot.action;
+  };
+  const transition = token => [...TRANSITION_MAP].find(([,value]) => value === token)?.[0] ?? `> ${token.replaceAll('_',' ').toUpperCase()}`;
+  const scenes = (doc.acts ?? []).flatMap(a => (a.scene_refs ?? []).map(id => sceneById.get(id))).filter(Boolean);
+  for (const scene of scenes) {
+    const xf = scene.extensions?.[XF] ?? {};
+    out.push(xf.heading_raw != null && xf.heading_raw.replace(/^\./,'') === scene.header ? xf.heading_raw : scene.header);
+    const included = new Set(scene.shot_refs ?? []);
+    const groups = new Map();
+    let pending = [];
+    for (const element of xf.elements ?? []) {
+      if (!element.shot_ref) { pending.push(element); continue; }
+      if (!included.has(element.shot_ref)) continue;
+      const group = groups.get(element.shot_ref) ?? [];
+      group.push(...pending,element); pending=[];groups.set(element.shot_ref,group);
+    }
+    for (const id of scene.shot_refs ?? []) {
+      const shot = shotById.get(id);
+      if (!shot) continue;
+      const elements = groups.get(id) ?? [];
+      const parked = shot.extensions?.[XF] ?? {};
+      let wroteAction = false, wroteTransition = false;
+      const emitted = new Set();
+      const emitRemaining = () => linesOf(shot).forEach((_,index) => {
+        if (!emitted.has(index)) { out.push(dialogue(shot,index));emitted.add(index); }
+      });
+      const synthUnchanged = parked.synthesized_for_dialogue && shot.action === (parked.source_action ?? `${parseCueLine(elements.find(e => e.type === 'dialogue')?.raw?.split('\n')[0] ?? '').name} speaks.`);
+      if (!elements.some(e => e.type === 'action') && !synthUnchanged) { out.push(action(shot));wroteAction=true; }
+      for (const element of elements) {
+        if (element.type === 'action') {
+          if (!wroteAction) {out.push(action(shot));wroteAction=true;}
+        } else if (element.type === 'dialogue') {
+          const index = element.dialogue_index ?? 0;
+          const rendered = dialogue(shot,index,element.raw);
+          if (rendered != null && !emitted.has(index)) out.push(rendered);
+          emitted.add(index);
+        } else if (element.type === 'transition') {
+          emitRemaining();
+          if (!wroteTransition && shot.transition_out) out.push(shot.transition_out === element.mapped ? element.raw : transition(shot.transition_out));
+          wroteTransition=true;
+        } else if (element.raw != null) out.push(element.raw);
+      }
+      emitRemaining();
+      if (!wroteTransition && shot.transition_out) out.push(transition(shot.transition_out));
+    }
+    out.push(...pending.filter(e => e.raw != null).map(e => e.raw));
+  }
+  return out.filter(value => value != null).join('\n\n') + (xfMeta.trailing ?? '\n');
 }
+
 
 // ── MUSCLE run-hook mode (cli route from spec/muscles/fountain-adapter.muscle.json)
 async function runHook() {
@@ -347,7 +381,7 @@ async function runHook() {
     // Park document-level Fountain data the host's structural importer drops.
     const parsed = fountainToSkel(subject.source_text, { file: subject.source_path ?? "input.fountain" });
     const xf = parsed.metadata.extensions[XF];
-    result.patches.push({ op: "add", path: "/metadata/extensions", value: { [XF]: xf } });
+    result.patches.push({ op: "add", path: "/metadata/extensions/x-fountain", value: xf });
     if (!envelope.document?.metadata?.source) {
       result.patches.push({ op: "add", path: "/metadata/source", value: parsed.metadata.source });
     }

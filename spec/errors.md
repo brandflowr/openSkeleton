@@ -34,6 +34,8 @@ Every error and warning uses the `SKELError` shape (ARCHITECTURE.md, hook-payloa
 | `YAML_PARSE_ERROR` | error | The `.skel` file is not parseable YAML (or `.skel.json` is not parseable JSON). CLI exit code 2. |
 | `SCHEMA_ERROR` | error | The parsed document fails `skel.schema.json` for the selected lifecycle. `message` carries the underlying schema violation; `path` the instance path. |
 
+The reference reader additionally reports `UNSUPPORTED_VERSION` for unsupported major versions (SKEL 2.x is supported, including compatible higher minors), and `INPUT_LIMIT_EXCEEDED` when bounded parsing/traversal fails. Current limits are 10 MB, depth 64, 200,000 visited values and 10,000 YAML merge keys; cyclic aliases are rejected. These are errors, and files rejected by the parser use CLI exit code 2.
+
 ## 4. Identity and Structure
 
 | Code | Severity | Condition |

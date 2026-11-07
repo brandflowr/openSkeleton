@@ -10,6 +10,8 @@ node reference/cli/skel.mjs validate spec/example.skel
 npx @openskeleton/cli validate story.skel
 ```
 
+Requires Node ≥22.12. In a source checkout run `npm ci` at the repository root. The release CLI depends on the matching spec version; `npm run test:package` tests both local tarballs together.
+
 ## Commands
 
 ### `skel validate <file>`
@@ -38,7 +40,7 @@ One screen of truth: title, version, lifecycle, series code, structure counts, c
 ## As a library
 
 ```js
-import { loadDocument, validateDocument } from "@openskeleton/cli/lib/validate.mjs";
+import { loadDocument, validateDocument } from "@openskeleton/spec/validator";
 const result = validateDocument(loadDocument("story.skel"), { lifecycle: "production" });
 ```
 

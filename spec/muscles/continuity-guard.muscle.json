@@ -19,7 +19,7 @@
     {
       "type": "cli",
       "label": "Continuity Guard CLI",
-      "command": "node reference/continuity-guard/continuity-guard.mjs",
+      "command": "node ../../reference/continuity-guard/continuity-guard.mjs",
       "requires": []
     }
   ]

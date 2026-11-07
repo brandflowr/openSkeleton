@@ -27,8 +27,8 @@
     {
       "type": "cli",
       "label": "Fountain Adapter CLI",
-      "command": "skel-fountain run-hook --payload -",
-      "requires": ["cli.skel-fountain"]
+      "command": "node ../../reference/fountain-adapter/skel-fountain.mjs run-hook --payload -",
+      "requires": []
     },
     {
       "type": "skill",

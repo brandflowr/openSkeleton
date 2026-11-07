@@ -1,302 +1,190 @@
-// muscle-host.mjs — reference MUSCLE host (MUSCLE Spec v1.0)
-// Zero-dependency Node.js (>=18) reference implementation of the host side
-// of the MUSCLE contract: discovery, manifest validation, hook invocation
-// via the `cli` execution route, mode enforcement, capability-scoped
-// RFC 6902 patch application with locked-entity protection, and atomic
-// rollback. This is a teaching/conformance artifact, not a product:
-// production hosts (Genlock, a `skel` CLI) implement the same rules.
-//
-// See: spec/muscle-spec.md, spec/hook-payload.schema.json
+// Reference MUSCLE 1.1 host: trusted CLI execution and transactional document patches.
+import {readFileSync, readdirSync, existsSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+import {join, dirname, resolve} from 'node:path';
+import {isDeepStrictEqual} from 'node:util';
+import Ajv from 'ajv';
+import addFormats from 'ajv-formats';
+import {SPEC_DIR, validateDocument, validateDocumentShape} from '../../lib/validator.mjs';
+import {assertDataLimits} from '../../lib/parse.mjs';
+import {pointer, getAt, applyOperation, changedPaths} from './json-patch.mjs';
 
-import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { join, dirname, resolve } from "node:path";
-
-export const PAYLOAD_VERSION = "1.0";
-
-export const HOOKS = [
-  "import.before", "import.after", "document.validate",
-  "prompt.assemble.before", "prompt.assemble.after", "generate.route",
-  "render.complete", "entity.changed", "export.before", "export.after",
-];
-const MODES = ["observe", "transform", "veto"];
-const CAPABILITIES = [
-  "read:document", "read:sidecars", "patch:metadata", "patch:acts",
-  "patch:scenes", "patch:shots", "patch:shot.bones", "patch:scene.bones",
-  "patch:v_setup", "patch:sidecars", "write:renders",
-];
-const CAP_XNS = /^patch:extensions\.x-[a-z0-9]+(-[a-z0-9]+)*$/;
-
-// ── Manifest validation ──────────────────────────────────────────────────────
-
-export function validateManifest(m) {
-  const errs = [];
-  const need = (k, ok) => { if (!ok) errs.push(`${k} missing or invalid`); };
-  need("muscle_id", typeof m.muscle_id === "string" && /^[a-z0-9]+(-[a-z0-9]+)*$/.test(m.muscle_id));
-  need("muscle_version", typeof m.muscle_version === "string" && /^\d+\.\d+\.\d+$/.test(m.muscle_version));
-  need("label", typeof m.label === "string" && m.label.length > 0);
-  need("hooks", Array.isArray(m.hooks) && m.hooks.length >= 1);
-  need("capabilities", Array.isArray(m.capabilities));
-  need("execution_routes", Array.isArray(m.execution_routes) && m.execution_routes.length >= 1);
-  for (const h of m.hooks ?? []) {
-    if (!HOOKS.includes(h.on)) errs.push(`unknown hook: ${h.on}`);
-    if (!MODES.includes(h.mode)) errs.push(`unknown mode: ${h.mode}`);
-  }
-  for (const c of m.capabilities ?? []) {
-    if (!CAPABILITIES.includes(c) && !CAP_XNS.test(c)) errs.push(`unknown capability: ${c}`);
-  }
-  const KNOWN = ["$schema", "muscle_id", "muscle_version", "label", "description",
-    "hooks", "capabilities", "execution_routes", "config_schema", "extensions"];
-  for (const k of Object.keys(m)) {
-    if (!KNOWN.includes(k) && !k.startsWith("x-")) errs.push(`unknown top-level field: ${k}`);
-  }
-  return errs;
+export const PAYLOAD_VERSION = '1.1';
+const readSchema = name => JSON.parse(readFileSync(join(SPEC_DIR,name),'utf8'));
+const manifestSchema = readSchema('muscle.schema.json');
+const payloadSchema = readSchema('hook-payload.schema.json');
+export const HOOKS = payloadSchema.definitions.HookEnvelope.properties.hook.enum;
+const ajv = new Ajv({allErrors:true,strict:false});
+addFormats(ajv);
+ajv.addSchema(payloadSchema);
+const checkManifest = ajv.compile(manifestSchema);
+const checkEnvelope = ajv.compile({$ref:payloadSchema.$id+'#/definitions/HookEnvelope'});
+const checkResult = ajv.compile({$ref:payloadSchema.$id+'#/definitions/HookResult'});
+const errorsOf = check => (check.errors ?? []).map(e => `${e.instancePath || '/'} ${e.message}`);
+export function validateManifest(manifest) {
+  return checkManifest(manifest) ? [] : errorsOf(checkManifest);
 }
 
-// ── Discovery (spec §6.1) ────────────────────────────────────────────────────
-
 export function discoverMuscles(dirs) {
-  const found = new Map(); // muscle_id → { manifest, dir } — later dirs override
+  const found = new Map();
   for (const dir of dirs) {
     if (!existsSync(dir)) continue;
-    for (const f of readdirSync(dir).filter((f) => f.endsWith(".muscle.json")).sort()) {
-      const path = join(dir, f);
+    for (const file of readdirSync(dir).filter(f => f.endsWith('.muscle.json')).sort()) {
+      const path = join(dir,file);
       try {
-        const manifest = JSON.parse(readFileSync(path, "utf-8"));
-        const errs = validateManifest(manifest);
-        if (errs.length) { console.error(`[muscle-host] skipping ${path}: ${errs.join("; ")}`); continue; }
-        found.set(manifest.muscle_id, { manifest, dir: resolve(dir), path });
-      } catch (e) {
-        console.error(`[muscle-host] skipping ${path}: ${e.message}`);
-      }
+        const manifest = JSON.parse(readFileSync(path,'utf8'));
+        const errors = validateManifest(manifest);
+        if (errors.length) throw new Error(errors.join('; '));
+        found.set(manifest.muscle_id,{manifest,dir:resolve(dir),path});
+      } catch (error) { console.error(`[muscle-host] skipping ${path}: ${error.message}`); }
     }
   }
   return [...found.values()];
 }
 
-// ── JSON Pointer / RFC 6902 (minimal, complete) ──────────────────────────────
-
-const unescape = (s) => s.replace(/~1/g, "/").replace(/~0/g, "~");
-const parsePtr = (p) => (p === "" ? [] : p.slice(1).split("/").map(unescape));
-
-function getAt(doc, tokens) {
-  let cur = doc;
-  for (const t of tokens) {
-    if (cur == null) return undefined;
-    cur = Array.isArray(cur) ? cur[t === "-" ? cur.length : +t] : cur[t];
-  }
-  return cur;
+export function patchAllowed(caps,path) {
+  const t = pointer(path);
+  if (t[0] === 'metadata' && t[1] === 'plugins') return false;
+  const extension = t.indexOf('extensions');
+  if (extension !== -1 && t[extension+1]?.startsWith('x-') && caps.includes(`patch:extensions.${t[extension+1]}`)) return true;
+  if (t[0] === 'metadata') return caps.includes('patch:metadata');
+  if (t[0] === 'shots' && t[2] === 'bones') return caps.includes('patch:shot.bones');
+  if (t[0] === 'scenes' && t[2] === 'bones') return caps.includes('patch:scene.bones');
+  if (t[0] === 'shots' && t[2] === 'v_setup') return caps.includes('patch:v_setup');
+  return ['acts','scenes','shots','characters','environments','props'].includes(t[0]) && caps.includes(`patch:${t[0]}`);
 }
 
-function applyOp(doc, op) {
-  const tokens = parsePtr(op.path);
-  if (op.op === "test") {
-    if (JSON.stringify(getAt(doc, tokens)) !== JSON.stringify(op.value)) throw new Error(`test failed at ${op.path}`);
-    return;
+const collections = ['acts','scenes','shots','characters','environments','props'];
+function checkLockedPath(path,doc) {
+  const t = pointer(path);
+  if (!collections.includes(t[0])) return;
+  const entities = t.length === 1 ? doc[t[0]] : [doc[t[0]]?.[t[1]]];
+  if (entities?.some(e => e?.creative_status === 'locked')) throw new Error(`Locked entity at ${path}`);
+}
+function checkEffects(before,after,caps) {
+  for (const path of changedPaths(before,after)) {
+    if (!patchAllowed(caps,path)) throw new Error(`Outside capabilities: ${path}`);
   }
-  if (op.op === "move" || op.op === "copy") {
-    const val = getAt(doc, parsePtr(op.from));
-    if (val === undefined) throw new Error(`from not found: ${op.from}`);
-    if (op.op === "move") applyOp(doc, { op: "remove", path: op.from });
-    return applyOp(doc, { op: "add", path: op.path, value: structuredClone(val) });
-  }
-  const key = tokens[tokens.length - 1];
-  const parent = getAt(doc, tokens.slice(0, -1));
-  if (parent == null) throw new Error(`path not found: ${op.path}`);
-  if (Array.isArray(parent)) {
-    const i = key === "-" ? parent.length : +key;
-    if (Number.isNaN(i) || i < 0 || i > parent.length) throw new Error(`bad index: ${op.path}`);
-    if (op.op === "add") parent.splice(i, 0, op.value);
-    else if (op.op === "remove") { if (i >= parent.length) throw new Error(`remove out of range: ${op.path}`); parent.splice(i, 1); }
-    else if (op.op === "replace") { if (i >= parent.length) throw new Error(`replace out of range: ${op.path}`); parent[i] = op.value; }
-  } else {
-    if (op.op === "add" || op.op === "replace") {
-      if (op.op === "replace" && !(key in parent)) throw new Error(`replace target missing: ${op.path}`);
-      parent[key] = op.value;
-    } else if (op.op === "remove") {
-      if (!(key in parent)) throw new Error(`remove target missing: ${op.path}`);
-      delete parent[key];
+  if (!isDeepStrictEqual(before.metadata?.plugins,after.metadata?.plugins)) throw new Error('metadata.plugins is host-owned');
+  for (const key of collections) {
+    for (const entity of before[key] ?? []) {
+      if (entity.creative_status === 'locked' && !isDeepStrictEqual(entity,after[key]?.find(e => e.id === entity.id))) throw new Error(`Locked entity: ${entity.id}`);
     }
   }
 }
-
-// ── Capability → path rules (spec §4.3 rule 1, §5) ──────────────────────────
-
-export function patchAllowed(caps, path, doc) {
-  const t = parsePtr(path);
-  if (t[0] === "metadata") {
-    if (t[1] === "plugins") return false; // host-owned, always
-    return caps.includes("patch:metadata");
-  }
-  // extensions.x-<ns> at any depth: .../extensions/x-<ns>/...
-  const extIdx = t.indexOf("extensions");
-  if (extIdx !== -1 && t[extIdx + 1]?.startsWith("x-")) {
-    if (caps.includes(`patch:extensions.${t[extIdx + 1]}`)) return true;
-  }
-  if (t[0] === "acts") return caps.includes("patch:acts");
-  if (t[0] === "scenes") {
-    if (t[2] === "bones") return caps.includes("patch:scene.bones");
-    return caps.includes("patch:scenes");
-  }
-  if (t[0] === "shots") {
-    if (t[2] === "bones") return caps.includes("patch:shot.bones");
-    if (t[2] === "v_setup") return caps.includes("patch:v_setup");
-    return caps.includes("patch:shots");
-  }
-  return false;
+function vivifyExtensions(doc,path) {
+  const tokens = pointer(path);
+  const i = tokens.indexOf('extensions');
+  if (i < 0 || !tokens[i+1]?.startsWith('x-')) return;
+  const parent = getAt(doc,tokens.slice(0,i));
+  if (parent && typeof parent === 'object' && parent.extensions === undefined) parent.extensions = {};
 }
+export function sanityCheck(doc) { return validateDocument(doc).errors.map(e => `${e.path} ${e.message}`); }
 
-function lockedViolation(path, doc) {
-  const t = parsePtr(path);
-  if ((t[0] === "scenes" || t[0] === "shots") && t[1] !== undefined) {
-    const entity = doc[t[0]]?.[+t[1]];
-    if (entity?.creative_status === "locked") return `${t[0]}[${t[1]}] (${entity.id ?? "?"}) is locked`;
+// Parse quoting only. No shell, expansion, pipes, or redirection is ever invoked.
+export function commandArguments(command) {
+  if (typeof command !== 'string') throw new Error('CLI route needs a command');
+  const args = []; let word = ''; let quote = null; let started = false;
+  for (let i=0;i<command.length;i++) {
+    const c = command[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (c === '\\' && command[i+1] === quote) word += command[++i];
+      else word += c;
+    } else if (c === '"' || c === "'") { quote=c; started=true; }
+    else if (/\s/.test(c)) { if (started) {args.push(word);word='';started=false;} }
+    else { if (/[|&;<>]/.test(c)) throw new Error('Shell operators are not supported'); word+=c;started=true; }
   }
-  return null;
+  if (quote) throw new Error('Unclosed command quote');
+  if (started) args.push(word);
+  if (!args.length || !args[0]) throw new Error('Empty CLI command');
+  return args;
 }
-
-// ── Light document sanity check (stand-in for full AJV validation) ──────────
-
-export function sanityCheck(doc) {
-  const errs = [];
-  if (typeof doc?.skel_version !== "string") errs.push("skel_version missing");
-  for (const k of ["acts", "scenes", "shots"]) if (doc[k] && !Array.isArray(doc[k])) errs.push(`${k} not an array`);
-  const ids = new Set();
-  for (const k of ["acts", "scenes", "shots"]) for (const e of doc[k] ?? []) {
-    if (!e.id) errs.push(`${k} entity missing id`);
-    else if (ids.has(e.id)) errs.push(`duplicate id: ${e.id}`);
-    else ids.add(e.id);
-  }
-  for (const a of doc.acts ?? []) for (const r of a.scene_refs ?? []) if (!ids.has(r)) errs.push(`dangling scene_ref: ${r}`);
-  for (const s of doc.scenes ?? []) for (const r of s.shot_refs ?? []) if (!ids.has(r)) errs.push(`dangling shot_ref: ${r}`);
-  return errs;
-}
-
-// ── Invocation (spec §4) ─────────────────────────────────────────────────────
-
-function invokeRoute(entry, envelope) {
-  // Reference host implements the `cli` route only. Others report unavailable.
-  const route = entry.manifest.execution_routes.find((r) => r.type === "cli");
-  if (!route) return { unavailable: true };
-  const res = spawnSync(route.command, {
-    shell: true,
-    cwd: dirname(entry.path),
-    input: JSON.stringify(envelope),
-    encoding: "utf-8",
-    timeout: envelope._timeout_ms ?? 30000,
+function invoke(entry,envelope,timeout) {
+  const route=entry.manifest.execution_routes.find(r=>r.type==='cli');
+  if (!route) throw new Error('No available execution route');
+  const [command,...args]=commandArguments(route.command);
+  const result=spawnSync(command === 'node' ? process.execPath : command,args,{
+    shell:false,cwd:dirname(entry.path),input:JSON.stringify(envelope),encoding:'utf8',timeout:timeout ?? 30000,windowsHide:true,maxBuffer:1024*1024,
   });
-  if (res.error || res.status !== 0) throw new Error(`route failed: ${res.error?.message ?? `exit ${res.status}`} ${res.stderr ?? ""}`.trim());
-  return { result: JSON.parse(res.stdout) };
+  if (result.error || result.status!==0) throw new Error(`Route failed: ${result.error?.message ?? result.stderr ?? result.status}`);
+  const value=JSON.parse(result.stdout);assertDataLimits(value);return value;
+}
+function filterMatch(filter,subject) {
+  return !filter || ((!filter.formats || filter.formats.includes(subject?.format)) && (!filter.bone_ids || filter.bone_ids.includes(subject?.bone_id)) && (!filter.entities || filter.entities.includes(subject?.entity)));
 }
 
-/**
- * Run one hook point. Mutates and returns `document` only via validated,
- * capability-checked, atomic patch sets. Returns a report.
- */
-export function runHook(hook, { muscles, document, subject, lifecycle = "draft", context = {} }) {
-  const report = { hook, ran: [], errors: [], warnings: [], subject };
-  const subs = muscles
-    .flatMap((m) => (m.manifest.hooks ?? [])
-      .filter((h) => h.on === hook && filterMatch(h.filter, subject))
-      .map((h) => ({ entry: m, sub: h })))
-    .sort((a, b) => (a.sub.priority ?? 100) - (b.sub.priority ?? 100));
-
-  for (const { entry, sub } of subs) {
-    const id = entry.manifest.muscle_id;
-    const caps = entry.manifest.capabilities;
-    const envelope = {
-      payload_version: PAYLOAD_VERSION,
-      hook, muscle_id: id, lifecycle,
-      context: { workspace_root: context.workspace_root ?? process.cwd(), project_slug: context.project_slug ?? "demo", config: context.config?.[id] ?? {} },
-      ...(caps.includes("read:document") ? { document } : {}),
-      ...(subject !== undefined ? { subject } : {}),
-      _timeout_ms: sub.timeout_ms,
-    };
-    const fail = (msg) => {
-      report.ran.push({ muscle_id: id, ok: false, note: msg });
-      console.error(`[muscle-host] ${id} on ${hook}: FAILED — ${msg}`);
-      if (sub.mode === "veto" && lifecycle !== "draft") report.errors.push({ code: `${id}.host_failure`, severity: "error", path: "", message: msg });
-    };
-
-    let result;
+export function runHook(hook,{muscles,document,subject,lifecycle='draft',context={}}) {
+  const report={hook,ran:[],errors:[],warnings:[],subject};
+  const subscribers=muscles.flatMap(entry=>(entry.manifest.hooks??[]).filter(sub=>sub.on===hook).map(sub=>({entry,sub})))
+    .sort((a,b)=>(a.sub.priority??100)-(b.sub.priority??100));
+  for (const {entry,sub} of subscribers) {
+    if (!filterMatch(sub.filter,report.subject)) continue;
+    const id=entry.manifest.muscle_id;
+    const caps=entry.manifest.capabilities;
     try {
-      const r = invokeRoute(entry, envelope);
-      if (r.unavailable) { report.ran.push({ muscle_id: id, ok: false, note: "no available execution route" }); continue; }
-      result = r.result;
-    } catch (e) { fail(e.message); continue; }
-
-    if (result?.payload_version !== PAYLOAD_VERSION || typeof result.ok !== "boolean") { fail("malformed result"); continue; }
-    if (!result.ok) { fail("plugin reported failure"); continue; }
-
-    // Mode enforcement (spec §3.3): reject results that exceed the declared mode.
-    if (sub.mode !== "transform" && (result.patches?.length || result.subject_replacement !== undefined)) { fail(`mode '${sub.mode}' may not return patches/subject_replacement`); continue; }
-    if (sub.mode !== "veto" && result.errors?.length) { fail(`mode '${sub.mode}' may not return errors`); continue; }
-
-    if (result.warnings?.length) report.warnings.push(...result.warnings);
-    if (sub.mode === "veto" && result.errors?.length) report.errors.push(...result.errors);
-
-    // subject_replacement: derived values only (spec §4.2). generate.route must pick a candidate.
-    if (result.subject_replacement !== undefined) {
-      if (hook === "generate.route") {
-        const candidates = subject?.routes ?? [];
-        const chosen = candidates.find((c) => JSON.stringify(c) === JSON.stringify(result.subject_replacement));
-        if (!chosen) { fail("subject_replacement is not a candidate route — falling back to default"); continue; }
-        report.subject = { ...subject, chosen_route: chosen };
-      } else if (hook === "prompt.assemble.after") {
-        report.subject = { ...report.subject, assembled_prompt: result.subject_replacement };
-      } else {
-        report.subject = result.subject_replacement;
+      const manifestErrors=validateManifest(entry.manifest);
+      if (manifestErrors.length) throw new Error(manifestErrors.join('; '));
+      const config=context.config?.[id]??{};
+      if (entry.manifest.config_schema && !ajv.compile(entry.manifest.config_schema)(config)) throw new Error('Invalid plugin configuration');
+      const envelope={payload_version:PAYLOAD_VERSION,hook,muscle_id:id,lifecycle,
+        context:{workspace_root:context.workspace_root??process.cwd(),project_slug:context.project_slug??'demo',config},
+        ...(caps.includes('read:document')?{document}:{}),...(report.subject!==undefined?{subject:report.subject}:{}),
+      };
+      if (!checkEnvelope(envelope)) throw new Error(`Invalid envelope: ${errorsOf(checkEnvelope).join('; ')}`);
+      const result=invoke(entry,envelope,sub.timeout_ms);
+      if (!checkResult(result) || !/^1\./.test(result.payload_version)) throw new Error('Malformed or unsupported result');
+      if (!result.ok) throw new Error('Plugin reported failure');
+      if (sub.mode!=='transform' && (result.patches?.length || result.subject_replacement!==undefined)) throw new Error(`Mode ${sub.mode} cannot transform`);
+      if (sub.mode!=='veto' && result.errors?.length) throw new Error(`Mode ${sub.mode} cannot veto`);
+      let nextSubject=report.subject;
+      if (result.subject_replacement!==undefined) {
+        if (hook==='generate.route') {
+          const chosen=report.subject?.routes?.find(r=>isDeepStrictEqual(r,result.subject_replacement));
+          if (!chosen) throw new Error('Replacement is not a candidate route');
+          nextSubject={...report.subject,chosen_route:chosen};
+        } else if (hook==='prompt.assemble.after') {
+          if (typeof result.subject_replacement!=='string') throw new Error('Prompt replacement must be a string');
+          nextSubject={...report.subject,assembled_prompt:result.subject_replacement};
+        } else throw new Error(`Subject replacement is not supported for ${hook}`);
       }
+      if (result.patches?.length) {
+        let staged=structuredClone(document);
+        for (const patch of result.patches) {
+          if (patch.op==='test') {
+            if (!caps.includes('read:document')) throw new Error('test requires read:document');
+          } else {
+            if (!patchAllowed(caps,patch.path)) throw new Error(`Outside capabilities: ${patch.path}`);
+            checkLockedPath(patch.path,staged);
+          }
+          if (patch.op==='move') {
+            if (!patchAllowed(caps,patch.from)) throw new Error(`Outside capabilities: ${patch.from}`);
+            checkLockedPath(patch.from,staged);
+          }
+          if (patch.op==='copy' && !caps.includes('read:document')) throw new Error('copy requires read:document');
+          const before=structuredClone(staged);
+          if (patch.op==='add') vivifyExtensions(staged,patch.path);
+          staged=applyOperation(staged,patch);
+          checkEffects(before,staged,caps);
+        }
+        const invalid=validateDocumentShape(staged);
+        if (invalid.length) throw new Error(`Document invalid after patches: ${invalid[0].message}`);
+        const validation=validateDocument(staged);
+        if (!validation.valid) throw new Error(`Document invalid after patches: ${validation.errors[0].message}`);
+        staged.metadata.plugins??=[];
+        const stamp={id,version:entry.manifest.muscle_version,last_ran:new Date().toISOString()};
+        const existing=staged.metadata.plugins.find(p=>p.id===id);
+        if (existing) Object.assign(existing,stamp);else staged.metadata.plugins.push(stamp);
+        Object.keys(document).forEach(key=>delete document[key]);Object.assign(document,staged);
+      }
+      report.subject=nextSubject;
+      report.warnings.push(...result.warnings??[]);
+      report.errors.push(...result.errors??[]);
+      report.ran.push({muscle_id:id,ok:true,applied:result.patches?.length??0});
+    } catch (error) {
+      report.ran.push({muscle_id:id,ok:false,note:error.message});
+      if (sub.mode==='veto' && lifecycle!=='draft') report.errors.push({code:`${id}.host_failure`,severity:'error',path:'',message:error.message});
     }
-
-    // Patch application (spec §4.3): capability check, locked check, atomic, re-validate.
-    if (result.patches?.length) {
-      const rejected = [];
-      for (const p of result.patches) {
-        if (!patchAllowed(caps, p.path, document)) rejected.push(`outside capabilities: ${p.op} ${p.path}`);
-        const lock = lockedViolation(p.path, document);
-        if (lock) rejected.push(`locked entity: ${p.op} ${p.path} (${lock})`);
-      }
-      if (rejected.length) { fail(`patch set rejected — ${rejected.join("; ")}`); continue; }
-      const before = structuredClone(document);
-      try {
-        for (const p of result.patches) { vivifyExtensions(document, p.path); applyOp(document, p); }
-        const sanity = sanityCheck(document);
-        if (sanity.length) throw new Error(`document invalid after patches: ${sanity.join("; ")}`);
-      } catch (e) {
-        Object.keys(document).forEach((k) => delete document[k]);
-        Object.assign(document, before);
-        fail(`rolled back — ${e.message}`);
-        continue;
-      }
-      // Record in metadata.plugins (spec §6.3) — host-owned.
-      document.metadata ??= {};
-      document.metadata.plugins ??= [];
-      const rec = document.metadata.plugins.find((r) => r.id === id);
-      const stamp = { id, version: entry.manifest.muscle_version, last_ran: new Date().toISOString() };
-      rec ? Object.assign(rec, stamp) : document.metadata.plugins.push(stamp);
-      report.ran.push({ muscle_id: id, ok: true, applied: result.patches.length });
-      continue;
-    }
-    report.ran.push({ muscle_id: id, ok: true, applied: 0 });
   }
   return report;
-}
-
-// Host obligation (spec §4.3): a patch under a declared x-<ns> namespace must
-// not fail just because the `extensions` container doesn't exist yet.
-function vivifyExtensions(doc, path) {
-  const t = parsePtr(path);
-  const extIdx = t.indexOf("extensions");
-  if (extIdx === -1 || !t[extIdx + 1]?.startsWith("x-")) return;
-  const parent = getAt(doc, t.slice(0, extIdx));
-  if (parent && typeof parent === "object" && parent.extensions === undefined) parent.extensions = {};
-}
-
-function filterMatch(filter, subject) {
-  if (!filter) return true;
-  if (filter.formats && subject?.format && !filter.formats.includes(subject.format)) return false;
-  if (filter.bone_ids && subject?.bone_id && !filter.bone_ids.includes(subject.bone_id)) return false;
-  if (filter.entities && subject?.entity && !filter.entities.includes(subject.entity)) return false;
-  return true;
 }
